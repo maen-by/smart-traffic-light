@@ -1,9 +1,20 @@
 # 🚦 Smart Traffic Light Control System
 
-![Arduino](https://img.shields.io/badge/Platform-Arduino-blue)
-![Language](https://img.shields.io/badge/Language-C%2FC%2B%2B-green)
-![Simulation](https://img.shields.io/badge/Simulation-Proteus-orange)
-![Status](https://img.shields.io/badge/Project-Completed-success)
+### 🔹 System Logic Flowchart
+![Flowchart](Docs/logic_flowchart.png)
+
+### 🔹 Arduino Wiring
+![Wiring](Docs/arduino_wiring.png)
+
+### 🔹 Full Intersection Simulation
+![Simulation](Docs/full_intersection_view.png)
+
+### 🔹 Signal Details
+![Green Signal](Docs/green_signal_detail.png)
+![Red Signal](Docs/red_signal_detail.png)
+
+### 🔹 Serial Monitor Output
+![Serial Output](Docs/serial_monitor_output.png)
 
 ---
 
