@@ -1,0 +1,13 @@
+# Reinforcement learning
+tensorflow>=2.12
+numpy
+
+# Hardware / serial communication
+pyserial
+
+# Data logging and analysis
+pandas
+openpyxl        # enables saving the traffic log as .xlsx
+
+# Charts and figures
+matplotlib

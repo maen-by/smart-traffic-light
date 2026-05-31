@@ -1,0 +1,349 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import Dense, Input, Lambda, Add
+from tensorflow.keras.optimizers import Adam
+import tensorflow.keras.backend as K
+import os
+
+# ══════════════════════════════════════════
+MODEL_PATH = r"D:\smart_traffic_rl_v3\final_model.keras"
+SAVE_DIR   = r"D:\smart_traffic_rl_v3"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+MAX_CARS       = 300.0
+MAX_WAIT       = 120.0
+N_SIGNALS      = 4
+STATE_DIM      = N_SIGNALS * 2 + 1
+N_ACTIONS      = N_SIGNALS
+CARS_PER_PHASE = 15
+SIM_STEPS      = 300
+TEST_RUNS      = 30
+
+# ══════════════════════════════════════════
+# Build Model
+# ══════════════════════════════════════════
+def build_dueling_dqn():
+    inp = Input(shape=(STATE_DIM,), name="state_input")
+    x   = Dense(256, activation="relu")(inp)
+    x   = Dense(256, activation="relu")(x)
+    x   = Dense(128, activation="relu")(x)
+    v   = Dense(64,  activation="relu")(x)
+    v   = Dense(1,   name="value")(v)
+    a   = Dense(64,  activation="relu")(x)
+    a   = Dense(N_ACTIONS, name="advantage")(a)
+    q   = Add(name="Q_values")([
+        v,
+        Lambda(lambda t: t - K.mean(t, axis=1, keepdims=True),
+               output_shape=lambda s: s)(a)
+    ])
+    m = Model(inputs=inp, outputs=q, name="DuelingDQN")
+    m.compile(optimizer=Adam(1e-4), loss="huber")
+    return m
+
+print("Loading model...")
+model = build_dueling_dqn()
+model(tf.zeros((1, STATE_DIM)))
+model.load_weights(MODEL_PATH)
+print("Model loaded ✅")
+
+# ══════════════════════════════════════════
+# Simulation Environment
+# ══════════════════════════════════════════
+class TrafficSim:
+    def __init__(self, seed=42):
+        np.random.seed(seed)
+        self.cars  = np.random.randint(50, 200, N_SIGNALS).astype(np.float32)
+        self.waits = np.zeros(N_SIGNALS, dtype=np.float32)
+        self.green = 0
+
+    def step(self, action):
+        # تمرير السيارات
+        if self.cars[action] <= CARS_PER_PHASE:
+            passed = self.cars[action]
+        else:
+            passed = float(CARS_PER_PHASE)
+        self.cars[action] = max(0.0, self.cars[action] - passed)
+
+        # تحديث الانتظار
+        for i in range(N_SIGNALS):
+            if i == action:
+                self.waits[i] = max(0.0, self.waits[i] - passed * 2)
+            else:
+                if self.cars[i] > 0:
+                    self.waits[i] = min(self.waits[i] + 5.0, MAX_WAIT)
+
+        # وصول سيارات جديدة
+        arrivals = np.random.poisson(lam=2.0, size=N_SIGNALS).astype(np.float32)
+        self.cars = np.clip(self.cars + arrivals, 0, MAX_CARS)
+        self.green = action
+
+        return {
+            "total_cars" : float(np.sum(self.cars)),
+            "avg_wait"   : float(np.mean(self.waits)),
+            "max_wait"   : float(np.max(self.waits)),
+            "passed"     : float(passed),
+            "fairness"   : float(np.std(self.waits)),
+        }
+
+    def state(self):
+        norm_cars  = self.cars / MAX_CARS
+        norm_waits = np.clip(self.waits / MAX_WAIT, 0, 1)
+        green_feat = np.array([(self.green + 1) / N_SIGNALS], dtype=np.float32)
+        return np.concatenate([norm_cars, norm_waits, green_feat])
+
+# ══════════════════════════════════════════
+# Algorithms
+# ══════════════════════════════════════════
+def run_fixed_time(seed):
+    sim = TrafficSim(seed)
+    logs = []
+    lane = 0
+    for step in range(SIM_STEPS):
+        if step % 8 == 0:
+            lane = (lane + 1) % N_SIGNALS
+        logs.append(sim.step(lane))
+    return logs
+
+def run_round_robin(seed):
+    sim = TrafficSim(seed)
+    logs = []
+    for step in range(SIM_STEPS):
+        logs.append(sim.step(step % N_SIGNALS))
+    return logs
+
+def run_fcfs(seed):
+    sim = TrafficSim(seed)
+    logs = []
+    for _ in range(SIM_STEPS):
+        non_empty = [i for i in range(N_SIGNALS) if sim.cars[i] > 0]
+        action = max(non_empty, key=lambda i: sim.waits[i]) if non_empty else 0
+        logs.append(sim.step(action))
+    return logs
+
+def run_ai_model(seed):
+    sim = TrafficSim(seed)
+    logs = []
+    green_steps = 0
+    for _ in range(SIM_STEPS):
+        q = model(
+            tf.constant(sim.state()[np.newaxis], dtype=tf.float32),
+            training=False).numpy()[0]
+        masked = q.copy()
+        for i in range(N_SIGNALS):
+            if sim.cars[i] <= 0:
+                masked[i] = -1e9
+            if i == sim.green and green_steps < 1:
+                masked[i] = -1e9
+        # اولوية للسيارات القليلة
+        for i in range(N_SIGNALS):
+            if 0 < sim.cars[i] < CARS_PER_PHASE and sim.waits[i] >= 15:
+                masked[i] += 50.0
+        if green_steps >= 10:
+            masked[sim.green] = -1e9
+        action = int(np.argmax(masked))
+        if action == sim.green:
+            green_steps += 1
+        else:
+            green_steps = 0
+        logs.append(sim.step(action))
+    return logs
+
+# ══════════════════════════════════════════
+# Run Tests
+# ══════════════════════════════════════════
+print(f"Running {TEST_RUNS} test episodes...")
+
+algorithms = {
+    "Fixed-Time"     : run_fixed_time,
+    "Round-Robin"    : run_round_robin,
+    "FCFS"           : run_fcfs,
+    "AI Model (Ours)": run_ai_model,
+}
+
+colors = {
+    "Fixed-Time"     : "#FF5722",
+    "Round-Robin"    : "#9C27B0",
+    "FCFS"           : "#2196F3",
+    "AI Model (Ours)": "#4CAF50",
+}
+
+all_results = {name: [] for name in algorithms}
+
+for seed in range(TEST_RUNS):
+    for name, fn in algorithms.items():
+        logs = fn(seed)
+        all_results[name].append({
+            "avg_cars"  : np.mean([l["total_cars"] for l in logs]),
+            "avg_wait"  : np.mean([l["avg_wait"]   for l in logs]),
+            "max_wait"  : np.max( [l["max_wait"]   for l in logs]),
+            "throughput": np.sum( [l["passed"]     for l in logs]),
+            "fairness"  : np.mean([l["fairness"]   for l in logs]),
+            "cars_log"  : [l["total_cars"] for l in logs],
+            "wait_log"  : [l["avg_wait"]   for l in logs],
+        })
+
+summary = {}
+for name in algorithms:
+    summary[name] = {
+        "avg_cars"  : np.mean([r["avg_cars"]   for r in all_results[name]]),
+        "avg_wait"  : np.mean([r["avg_wait"]   for r in all_results[name]]),
+        "max_wait"  : np.mean([r["max_wait"]   for r in all_results[name]]),
+        "throughput": np.mean([r["throughput"] for r in all_results[name]]),
+        "fairness"  : np.mean([r["fairness"]   for r in all_results[name]]),
+        "cars_log"  : np.mean([r["cars_log"]   for r in all_results[name]], axis=0),
+        "wait_log"  : np.mean([r["wait_log"]   for r in all_results[name]], axis=0),
+    }
+
+print("\n── Results ─────────────────────────────────────────")
+print(f"{'Method':<20} {'Avg Cars':>10} {'Avg Wait':>10} {'Throughput':>12} {'Fairness':>10}")
+print("-" * 65)
+for name in algorithms:
+    s = summary[name]
+    print(f"{name:<20} {s['avg_cars']:>10.1f} {s['avg_wait']:>10.1f} "
+          f"{s['throughput']:>12.0f} {s['fairness']:>10.2f}")
+
+# ══════════════════════════════════════════
+# LinkedIn Chart
+# ══════════════════════════════════════════
+fig = plt.figure(figsize=(18, 14))
+fig.patch.set_facecolor('#0D1117')
+gs  = GridSpec(3, 2, figure=fig, hspace=0.5, wspace=0.35)
+
+fig.suptitle(
+    "Smart Traffic Light — AI Model vs Classical Algorithms",
+    fontsize=20, fontweight="bold", color="white", y=0.98
+)
+fig.text(
+    0.5, 0.945,
+    "Dueling DQN + Double DQN + Prioritized Experience Replay  |  4-Lane Intersection  |  30 Test Episodes",
+    ha="center", fontsize=11, color="#8B949E"
+)
+
+def style_ax(ax, title):
+    ax.set_facecolor('#161B22')
+    ax.set_title(title, color="white", fontsize=12, fontweight="bold", pad=12)
+    ax.tick_params(colors='#8B949E', labelsize=9)
+    for spine in ['bottom', 'left']:
+        ax.spines[spine].set_color('#30363D')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.12, color='white', linestyle='--')
+    ax.yaxis.label.set_color('#8B949E')
+    ax.xaxis.label.set_color('#8B949E')
+
+names = list(algorithms.keys())
+
+# ── Chart 1: Cars over time ──────────────────────────────────
+ax1 = fig.add_subplot(gs[0, :])
+for name in names:
+    lw    = 3.0 if name == "AI Model (Ours)" else 1.5
+    alpha = 1.0 if name == "AI Model (Ours)" else 0.55
+    ax1.plot(summary[name]["cars_log"],
+             color=colors[name], lw=lw, alpha=alpha, label=name)
+style_ax(ax1, "🚗  Total Cars in System Over Time  (Lower = Better)")
+ax1.set_xlabel("Simulation Step")
+ax1.set_ylabel("Total Cars")
+ax1.legend(facecolor='#1F2937', labelcolor='white',
+           fontsize=10, loc='upper right',
+           framealpha=0.8, edgecolor='#30363D')
+
+# ── Chart 2: Avg Cars bar ────────────────────────────────────
+ax2  = fig.add_subplot(gs[1, 0])
+vals = [summary[n]["avg_cars"] for n in names]
+bars = ax2.bar(names, vals, color=[colors[n] for n in names],
+               alpha=0.85, edgecolor='#30363D', linewidth=0.8,
+               width=0.55)
+ai_val = summary["AI Model (Ours)"]["avg_cars"]
+for bar, val, name in zip(bars, vals, names):
+    color = "white"
+    label = f"{val:.1f}"
+    if name == "AI Model (Ours)":
+        label = f"★ {val:.1f}"
+    ax2.text(bar.get_x() + bar.get_width() / 2,
+             bar.get_height() + 0.3,
+             label, ha="center", va="bottom",
+             color=color, fontsize=10, fontweight="bold")
+style_ax(ax2, "📊  Avg Cars in System  (Lower = Better)")
+ax2.set_ylabel("Avg Cars")
+ax2.set_xticklabels(names, rotation=12, ha='right', fontsize=9)
+
+# ── Chart 3: Throughput bar ──────────────────────────────────
+ax3   = fig.add_subplot(gs[1, 1])
+vals3 = [summary[n]["throughput"] for n in names]
+bars3 = ax3.bar(names, vals3, color=[colors[n] for n in names],
+                alpha=0.85, edgecolor='#30363D', linewidth=0.8,
+                width=0.55)
+for bar, val, name in zip(bars3, vals3, names):
+    label = f"★ {val:.0f}" if name == "AI Model (Ours)" else f"{val:.0f}"
+    ax3.text(bar.get_x() + bar.get_width() / 2,
+             bar.get_height() + 0.3,
+             label, ha="center", va="bottom",
+             color="white", fontsize=10, fontweight="bold")
+style_ax(ax3, "✅  Total Cars Passed  (Higher = Better)")
+ax3.set_ylabel("Cars Passed")
+ax3.set_xticklabels(names, rotation=12, ha='right', fontsize=9)
+
+# ── Chart 4: Wait time over time ─────────────────────────────
+ax4 = fig.add_subplot(gs[2, 0])
+for name in names:
+    lw    = 3.0 if name == "AI Model (Ours)" else 1.5
+    alpha = 1.0 if name == "AI Model (Ours)" else 0.55
+    ax4.plot(summary[name]["wait_log"],
+             color=colors[name], lw=lw, alpha=alpha, label=name)
+style_ax(ax4, "⏱  Avg Wait Time Over Time  (Lower = Better)")
+ax4.set_xlabel("Simulation Step")
+ax4.set_ylabel("Avg Wait (s)")
+ax4.legend(facecolor='#1F2937', labelcolor='white',
+           fontsize=9, framealpha=0.8, edgecolor='#30363D')
+
+# ── Chart 5: Improvement table ───────────────────────────────
+ax5 = fig.add_subplot(gs[2, 1])
+ax5.set_facecolor('#161B22')
+ax5.axis('off')
+ax5.set_title("🏆  AI Model Improvement vs Others",
+               color="white", fontsize=12, fontweight="bold", pad=12)
+
+ai  = summary["AI Model (Ours)"]
+rows = []
+for name in names:
+    if name == "AI Model (Ours)":
+        continue
+    r  = summary[name]
+    ci = (r["avg_cars"]   - ai["avg_cars"])   / r["avg_cars"]   * 100
+    wi = (r["avg_wait"]   - ai["avg_wait"])   / r["avg_wait"]   * 100
+    ti = (ai["throughput"] - r["throughput"]) / r["throughput"] * 100
+    rows.append([
+        name,
+        f"↓ {ci:.1f}%"  if ci > 0 else f"↑ {abs(ci):.1f}%",
+        f"↓ {wi:.1f}%"  if wi > 0 else f"↑ {abs(wi):.1f}%",
+        f"↑ {ti:.1f}%"  if ti > 0 else f"↓ {abs(ti):.1f}%",
+    ])
+
+table = ax5.table(
+    cellText=rows,
+    colLabels=["vs Algorithm", "Cars Reduced", "Wait Reduced", "Throughput +"],
+    cellLoc='center', loc='center', bbox=[0, 0.05, 1, 0.9]
+)
+table.auto_set_font_size(False)
+table.set_fontsize(10)
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor('#30363D')
+    if row == 0:
+        cell.set_facecolor('#1F6FEB')
+        cell.set_text_props(color='white', fontweight='bold')
+    elif row % 2 == 1:
+        cell.set_facecolor('#0D1117')
+        cell.set_text_props(color='#4CAF50' if col > 0 else 'white')
+    else:
+        cell.set_facecolor('#161B22')
+        cell.set_text_props(color='#4CAF50' if col > 0 else 'white')
+
+plt.tight_layout(rect=[0, 0, 1, 0.94])
+path = os.path.join(SAVE_DIR, "linkedin_comparison.png")
+plt.savefig(path, dpi=200, bbox_inches="tight", facecolor='#0D1117')
+plt.show()
+print(f"\nSaved: {path}")
+print("Ready for LinkedIn! 🎉")
